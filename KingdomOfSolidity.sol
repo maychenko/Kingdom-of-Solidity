@@ -21,6 +21,7 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
     error TargetHasNoArmy();
     error InvalidResourceType();
     error InvalidExchange();
+    error BuildingRequired();
 
     enum BuildingType { Sawmill, Mine, GoldMine, Farm, Barracks, Walls, Academy }
     enum ResourceType { Gold, Wood, Stone, Food }
@@ -85,7 +86,6 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
     address[] public kingdomAddresses;
 
     uint256 public treasuryGold;
-    
     GameEvent public currentEvent = GameEvent.None;
 
     event KingdomCreated(address indexed owner, string name);
@@ -135,55 +135,52 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         k.buildings.walls = 1;
 
         kingdomAddresses.push(msg.sender);
-
         emit KingdomCreated(msg.sender, _name);
     }
 
-    function collectResources() public onlyKingdomOwner whenNotPaused nonReentrant {
-        Kingdom storage k = kingdoms[msg.sender];
+    function _internalCollect(address _user) internal {
+        Kingdom storage k = kingdoms[_user];
         uint256 timePassed = block.timestamp - k.lastCollectTime;
-        if (timePassed == 0) return;
+        if (timePassed < 60) return; 
+        
         uint256 minutesPassed = timePassed / 60;
-        if (minutesPassed == 0) return;
 
-        uint256 woodProduced;
-        uint256 stoneProduced;
-        uint256 goldProduced;
-        uint256 foodProduced;
+        uint256 woodProduced = minutesPassed * (k.buildings.sawmill * 2 + k.workers.InSawmill * 5);
+        uint256 stoneProduced = minutesPassed * (k.buildings.mine * 2 + k.workers.InMine * 5);
+        uint256 goldProduced = minutesPassed * (k.buildings.goldMine * 1 + k.workers.InGoldMine * 3);
+        uint256 foodProduced = minutesPassed * (k.buildings.farm * 3 + k.workers.InFarm * 6);
 
-        {
-            woodProduced = minutesPassed * (k.buildings.sawmill * 2 + k.workers.InSawmill * 5);
-            stoneProduced = minutesPassed * (k.buildings.mine * 2 + k.workers.InMine * 5);
-            goldProduced = minutesPassed * (k.buildings.goldMine * 1 + k.workers.InGoldMine * 3);
-            foodProduced = minutesPassed * (k.buildings.farm * 3 + k.workers.InFarm * 6);
+        uint256 ecoTech = k.techs.economics * 10;
+        woodProduced += (woodProduced * ecoTech) / 100;
+        stoneProduced += (stoneProduced * ecoTech) / 100;
+        goldProduced += (goldProduced * ecoTech) / 100;
+        foodProduced += (foodProduced * (k.techs.agriculture * 15)) / 100;
 
-            uint256 ecoTech = k.techs.economics * 10;
-            woodProduced += (woodProduced * ecoTech) / 100;
-            stoneProduced += (stoneProduced * ecoTech) / 100;
-            goldProduced += (goldProduced * ecoTech) / 100;
-            foodProduced += (foodProduced * (k.techs.agriculture * 15)) / 100;
-
-            if (currentEvent == GameEvent.DoubleResource) {
-                woodProduced *= 2;
-                stoneProduced *= 2;
-                goldProduced *= 2;
-                foodProduced *= 2;
-            }
+        if (currentEvent == GameEvent.DoubleResource) {
+            woodProduced *= 2;
+            stoneProduced *= 2;
+            goldProduced *= 2;
+            foodProduced *= 2;
         }
 
         k.wood += woodProduced;
         k.stone += stoneProduced;
         k.gold += goldProduced;
         k.food += foodProduced;
-        k.lastCollectTime = block.timestamp;
+        
+        k.lastCollectTime += minutesPassed * 60;
 
-        emit ResourcesCollected(msg.sender, goldProduced, woodProduced, stoneProduced, foodProduced);
+        emit ResourcesCollected(_user, goldProduced, woodProduced, stoneProduced, foodProduced);
+    }
+
+    function collectResources() public onlyKingdomOwner whenNotPaused nonReentrant {
+        _internalCollect(msg.sender);
     }
 
     function distributeWorkers(uint256 _saw, uint256 _mine, uint256 _gold, uint256 _farm) external onlyKingdomOwner whenNotPaused {
-        Kingdom storage k = kingdoms[msg.sender];
-        collectResources(); 
+        _internalCollect(msg.sender); 
 
+        Kingdom storage k = kingdoms[msg.sender];
         uint256 totalNeeded = _saw + _mine + _gold + _farm;
         uint256 maxWorkers = k.population / 2; 
 
@@ -199,8 +196,8 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
     }
 
     function upgradeBuilding(BuildingType _type) external onlyKingdomOwner whenNotPaused {
+        _internalCollect(msg.sender);
         Kingdom storage k = kingdoms[msg.sender];
-        collectResources();
 
         uint256 currentLvl = _getBuildingLevel(k, _type);
         if (currentLvl >= MAX_BUILDING_LEVEL) revert MaxLevelReached();
@@ -230,6 +227,10 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         if (_count == 0) return;
         Kingdom storage k = kingdoms[msg.sender];
         
+        if (_troop == TroopType.Swordsman && k.buildings.barracks < 1) revert BuildingRequired();
+        if (_troop == TroopType.Archer && k.buildings.barracks < 2) revert BuildingRequired();
+        if (_troop == TroopType.Knight && k.buildings.barracks < 3) revert BuildingRequired();
+
         uint256 goldCost; uint256 foodCost;
         if (_troop == TroopType.Swordsman) { goldCost = 20 * _count; foodCost = 10 * _count; }
         else if (_troop == TroopType.Archer) { goldCost = 30 * _count; foodCost = 15 * _count; }
@@ -244,6 +245,9 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         k.gold -= goldCost;
         k.food -= foodCost;
 
+        uint256 fee = (goldCost * MARKET_FEE_PERCENT) / 100;
+        treasuryGold += fee;
+
         if (_troop == TroopType.Swordsman) k.army.swordsmen += _count;
         else if (_troop == TroopType.Archer) k.army.archers += _count;
         else k.army.knights += _count;
@@ -253,7 +257,7 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
 
     function researchTechnology(TechType _tech) external onlyKingdomOwner whenNotPaused {
         Kingdom storage k = kingdoms[msg.sender];
-        if (k.buildings.academy == 0) revert InsufficientResources(); 
+        if (k.buildings.academy == 0) revert BuildingRequired(); 
 
         uint256 currentTechLvl = _getTechLevel(k, _tech);
         uint256 cost = (currentTechLvl + 1) * 150;
@@ -272,8 +276,8 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         if (_amount == 0) return;
         if (_sell == _buy) revert InvalidExchange();
         
+        _internalCollect(msg.sender);
         Kingdom storage k = kingdoms[msg.sender];
-        collectResources();
 
         uint256 sellBalance = _getResourceBalance(k, _sell);
         if (sellBalance < _amount) revert InsufficientResources();
@@ -299,8 +303,8 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         if (_defender == msg.sender) revert CannotAttackSelf();
         if (!kingdoms[_defender].exists) revert KingdomDoesNotExist();
 
-        collectResources();
-        _collectResourcesForAddress(_defender);
+        _internalCollect(msg.sender);
+        _internalCollect(_defender);
 
         Kingdom storage attacker = kingdoms[msg.sender];
         Kingdom storage defender = kingdoms[_defender];
@@ -308,7 +312,6 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         uint256 attackPower;
         uint256 defensePower;
 
-    
         {
             attackPower = (attacker.army.swordsmen * 15) + 
                           (attacker.army.archers * 12) + 
@@ -321,7 +324,7 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
             defensePower = (defender.army.swordsmen * 15) + 
                            (defender.army.archers * 12) + 
                            (defender.army.knights * 35);
-                                   
+                                    
             defensePower += defender.buildings.walls * 30;
             defensePower += (defensePower * (defender.techs.engineering * 12)) / 100;
 
@@ -376,7 +379,7 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         if (_type == BuildingType.Farm) return k.buildings.farm;
         if (_type == BuildingType.Barracks) return k.buildings.barracks;
         if (_type == BuildingType.Walls) return k.buildings.walls;
-        return k.buildings.academy;
+        return k.buildings.academy; 
     }
 
     function _setBuildingLevel(Kingdom storage k, BuildingType _type, uint256 _level) internal {
@@ -428,44 +431,5 @@ contract KingdomOfSolidity is AccessControl, Pausable, ReentrancyGuard {
         k.army.swordsmen -= (k.army.swordsmen * percent) / 100;
         k.army.archers -= (k.army.archers * percent) / 100;
         k.army.knights -= (k.army.knights * percent) / 100;
-    }
-
-    function _collectResourcesForAddress(address _user) internal {
-        Kingdom storage k = kingdoms[_user];
-        uint256 timePassed = block.timestamp - k.lastCollectTime;
-        if (timePassed == 0) return;
-        uint256 minutesPassed = timePassed / 60;
-        if (minutesPassed == 0) return;
-
-        uint256 woodProduced;
-        uint256 stoneProduced;
-        uint256 goldProduced;
-        uint256 foodProduced;
-
-        {
-            woodProduced = minutesPassed * (k.buildings.sawmill * 2 + k.workers.InSawmill * 5);
-            stoneProduced = minutesPassed * (k.buildings.mine * 2 + k.workers.InMine * 5);
-            goldProduced = minutesPassed * (k.buildings.goldMine * 1 + k.workers.InGoldMine * 3);
-            foodProduced = minutesPassed * (k.buildings.farm * 3 + k.workers.InFarm * 6);
-
-            uint256 ecoTech = k.techs.economics * 10;
-            woodProduced += (woodProduced * ecoTech) / 100;
-            stoneProduced += (stoneProduced * ecoTech) / 100;
-            goldProduced += (goldProduced * ecoTech) / 100;
-            foodProduced += (foodProduced * (k.techs.agriculture * 15)) / 100;
-
-            if (currentEvent == GameEvent.DoubleResource) {
-                woodProduced *= 2;
-                stoneProduced *= 2;
-                goldProduced *= 2;
-                foodProduced *= 2;
-            }
-        }
-
-        k.wood += woodProduced;
-        k.stone += stoneProduced;
-        k.gold += goldProduced;
-        k.food += foodProduced;
-        k.lastCollectTime = block.timestamp;
     }
 }
